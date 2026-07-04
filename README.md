@@ -4,26 +4,24 @@
 
 Create Adobe DNG RAW files using Python.
 
-![](demo.jpg)
-
-## **Features**
+## ![](demo.jpg)**Features**
 
 *   8,10,12,14,16-bit precision
 *   Lossless compression
 *   DNG Tags ( extensible )
 
-### Works with any **Bayer RAW** Data including native support for **Raspberry Pi cameras**.
+### Works with any **Bayer RAW** Data including native support for **Raspberry Pi cameras**:
 
 *   OV5467 ( Raspberry Pi Camera Module V1 )
 *   IMX219 ( Raspberry Pi Camera Module V2 )
 *   IMX477 ( Raspberry Pi High Quality Camera )
 
-Changes from the original version:
+### Changes from the original version:
 
 *   Supports files shot in binned mode
 *   Supports files which have RAW data in full res, but with binned thumbnail
 
-JPEG vs DNG:
+### JPEG vs DNG:
 
 ![JPEG](samples/THUMBNAIL.jpg) ![DNG](samples/DNG.jpg)
 
