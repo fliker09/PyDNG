@@ -151,81 +151,87 @@ class RPICAM2DNG:
         }
 
     def __extractRAW__(self, img):
-
-        isfile = False
-
         if isinstance(img, str) and os.path.exists(img):
-            isfile = True
+            with open(img, 'rb') as f:
+                file_data = f.read()
         elif isinstance(img, io.BytesIO):
-            isfile = False
-        else:
-            raise ValueError
-        if isfile:
-            file = open(img, 'rb')
-            img = io.BytesIO(file.read())
-            self.__exif__ = exifread.process_file(img)
-        else:
             img.seek(0)
-            self.__exif__ = exifread.process_file(img)
-
-        ver = {
-            'RP_ov5647': 1,
-            'RP_imx219': 2,
-            'RP_testc': 3,
-            'RP_imx477': 3,
-            "imx477": 3,
-        }[str(self.__exif__['Image Model'])]
-
-        if int(str(self.__exif__['Image ImageWidth'])) == 2028 \
-            and int(str(self.__exif__['Image ImageLength'])) == 1520 \
-                and ver == 3:
-            ver = 4
-
-        offset = {
-            1: 6404096,
-            2: 10270208,
-            3: 18711040,
-            4: 4751360,
-        }[ver]
-
-        self.maker_note = parseMaker(
-            bytearray(self.__exif__['EXIF MakerNote'].values).decode())
-
-        data = img.getvalue()[-offset:]
-        assert data[:4] == 'BRCM'.encode("ascii")
-
-        self.header = BroadcomRawHeader.from_buffer_copy(
-            data[176:176 + ctypes.sizeof(BroadcomRawHeader)])
-
-        data = data[32768:]
-        data = np.frombuffer(data, dtype=np.uint8)
-
-        reshape, crop = {
-            1: ((1952, 3264), (1944, 3240)),
-            2: ((2480, 4128), (2464, 4100)),
-            3: ((3056, 6112), (3040, 6084)),
-            4: ((1536, 3072), (1520, 3042)),
-        }[ver]
-        data = data.reshape(reshape)[:crop[0], :crop[1]]
-
-        if ver < 3:
-            data = data.astype(np.uint16) << 2
-            for byte in range(4):
-                data[:, byte::5] |= (
-                    (data[:, 4::5] >> ((4 - byte) * 2)) & 0b11)
-            data = np.delete(data, np.s_[4::5], 1)
+            file_data = img.read()
         else:
-            data = data.astype(np.uint16)
-            shape = data.shape
-            unpacked_data = np.zeros(
-                (shape[0], int(shape[1] / 3 * 2)), dtype=np.uint16)
-            unpacked_data[:, ::2] = (data[:, ::3] << 4) + \
-                (data[:, 2::3] & 0x0F)
-            unpacked_data[:, 1::2] = (
-                data[:, 1::3] << 4) + ((data[:, 2::3] >> 4) & 0x0F)
-            data = unpacked_data
+            raise ValueError("Invalid input")
 
-        return data
+        self.__exif__ = exifread.process_file(io.BytesIO(file_data))
+        file_size_mb = len(file_data) / (1024 * 1024)
+
+        # 1. FIND THE CORRECT HEADER
+        # Use find() to get the earliest RAW block, which contains the full data
+        pos = file_data.find(b'BRCM')
+        if pos == -1:
+            raise ValueError("No BRCM header found")
+
+        header_offset = pos + 176
+        self.header = BroadcomRawHeader.from_buffer_copy(file_data[header_offset:header_offset + ctypes.sizeof(BroadcomRawHeader)])
+
+        # 2. RESOLUTION & STRIDE LOGIC
+        # Force Mode 2 for large files (3280x2464)
+        if self.header.width == 1640 and file_size_mb > 10.0:
+            print(f"Forcing Mode 2 Resolution: {file_size_mb:.2f}MB file.")
+            target_width = 3280
+            target_height = 2464
+            stride = 4128
+        else:
+            target_width = self.header.width
+            target_height = self.header.height
+            # Calculate 32-byte aligned stride
+            stride = (int(target_width * 1.25) + 31) & ~31
+            if target_width == 1640:
+                stride = 2080
+
+        # 3. DATA EXTRACTION
+        # The RAW data starts exactly 32768 bytes after the 'BRCM' signature
+        image_data_start = pos + 32768
+        image_data = file_data[image_data_start:]
+
+        # Validate that we have enough data for the expected resolution
+        required_bytes = target_height * stride
+        if len(image_data) < required_bytes:
+            print(f"Warning: Data block too small ({len(image_data)}). Falling back to header detection.")
+            # If the block is too small, the 'pos' was likely a false positive
+            # This handles cases where there are thumbnail headers before the real RAW
+            pos = file_data.find(b'BRCM', pos + 1)
+            image_data = file_data[pos + 32768:]
+
+        # 4. RESHAPE & UNPACK
+        available_rows = len(image_data) // stride
+        final_height = min(target_height, available_rows)
+
+        image_data = image_data[:available_rows * stride]
+        packed = np.frombuffer(image_data, dtype=np.uint8).reshape(available_rows, stride)
+
+        # Ensure width is divisible by 5 for 10-bit group unpacking
+        active_packed_bytes = (int(target_width * 1.25) // 5) * 5
+        packed_active = packed[:final_height, :active_packed_bytes]
+
+        h, w_p = packed_active.shape
+        groups = w_p // 5
+
+        out = np.zeros((h, groups * 4), dtype=np.uint16)
+        p = packed_active.reshape(h, groups, 5)
+
+        # 10-bit → 16-bit Unpacking
+        out[:, 0::4] = ((p[:, :, 0].astype(np.uint16) << 2) | (p[:, :, 4] >> 6))
+        out[:, 1::4] = ((p[:, :, 1].astype(np.uint16) << 2) | ((p[:, :, 4] >> 4) & 0x03))
+        out[:, 2::4] = ((p[:, :, 2].astype(np.uint16) << 2) | ((p[:, :, 4] >> 2) & 0x03))
+        out[:, 3::4] = ((p[:, :, 3].astype(np.uint16) << 2) | (p[:, :, 4] & 0x03))
+
+        # Update metadata for DNG writer
+        self.header.width = out.shape[1]
+        self.header.height = out.shape[0]
+        if self.header.bayer_order > 3:
+            self.header.bayer_order = 0
+
+        #print(f"Final Shape: {out.shape}, Bytes found: {len(image_data)}")
+        return out
 
     def __process__(self, input_file, processing):
 
@@ -332,7 +338,7 @@ class RPICAM2DNG:
             ci2 = 23
 
         baseline_exp = 1
-        
+
         camera_calibration = [[1, 1], [0, 1], [0, 1],
                               [0, 1], [1, 1], [0, 1],
                               [0, 1], [0, 1], [1, 1]]
